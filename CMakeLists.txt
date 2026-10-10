@@ -684,7 +684,12 @@ if(ENABLE_VR)
   set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
   set(BUILD_SDK_TESTS OFF CACHE BOOL "" FORCE)
   set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+  set(BUILD_LOADER_WITH_EXCEPTION_HANDLING ON CACHE BOOL "" FORCE)
   add_subdirectory(Externals/OpenXR "${CMAKE_BINARY_DIR}/Externals/OpenXR" EXCLUDE_FROM_ALL)
+  if(ANDROID)
+    # jnipp (the loader's Android JNI helper) throws, so re-enable exceptions for the loader only.
+    target_compile_options(openxr_loader PRIVATE -fexceptions)
+  endif()
 endif()
 
 if(NOT (WIN32 AND _M_ARM_64))

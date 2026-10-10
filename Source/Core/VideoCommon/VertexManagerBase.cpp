@@ -13,6 +13,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Contains.h"
 #include "Common/EnumMap.h"
+#include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 #include "Common/MathUtil.h"
 #include "Common/SmallVector.h"
@@ -1326,7 +1327,8 @@ void VertexManagerBase::Flush()
                     elements.GetOverrideScreenPaneDepth(*element_draw, &screen_pane_group);
               }
               else if (handling == ShaderHunter::HandlingType::Screen ||
-                  handling == ShaderHunter::HandlingType::HeadLocked)
+                       handling == ShaderHunter::HandlingType::HeadLocked ||
+                       handling == ShaderHunter::HandlingType::HudPlane)
               {
                 element_depth = elements.GetOverrideElementDepth(*element_draw);
               }
@@ -1437,6 +1439,21 @@ void VertexManagerBase::Flush()
                     screen_pane_depth == ElementsGroupManager::ScreenPaneDepthMode::VR ?
                         screen_pane_group :
                         0;
+              }
+            }
+            else if (handling == ShaderHunter::HandlingType::HudPlane)
+            {
+              // Flatten onto one plane in front of the camera (GeometryShaderManager), with
+              // the full-frame raster state of the Screen Pane path so the game's pane
+              // scissor doesn't clip the reprojected element.
+              constexpr float DEFAULT_HUD_PLANE_DEPTH = 3.0f;  // game units
+              manual_screen_pane = g_ActiveConfig.stereo_mode == StereoMode::OpenXR &&
+                                   VR::GetVRFrameRegion().valid &&
+                                   xfmem.projection.type == ProjectionType::Perspective;
+              if (manual_screen_pane)
+              {
+                geometry_shader_manager.vr_hud_plane_depth =
+                    element_depth > 0.0f ? element_depth : DEFAULT_HUD_PLANE_DEPTH;
               }
             }
             else if (handling == ShaderHunter::HandlingType::Fullscreen)
@@ -1695,6 +1712,54 @@ void VertexManagerBase::Flush()
             const bool color_update = bpmem.blendmode.color_update != 0;
             const bool alpha_update = bpmem.blendmode.alpha_update != 0;
             const bool z_update = bpmem.zmode.update_enable != 0;
+            // PSO VR: also report bound EFB copies (post-process overlays) and the blend state.
+            std::string efb_info;
+            for (const u32 i : used_textures)
+            {
+              u32 copy_w = 0, copy_h = 0;
+              if (g_texture_cache->IsBoundEfbCopy(i, &copy_w, &copy_h))
+                efb_info += fmt::format(" efbcopy{}={}x{}", i, copy_w, copy_h);
+            }
+            // Fields needed to hand-write an [ElementsGroupOverride] render-state signature
+            // (sig_alpha, sig_blend_color/alpha), the bound texture hashes (texture= filters) and
+            // the model origin's view Z (layer depth of perspective HUD elements).
+            std::string tex_info;
+            for (const u32 i : used_textures)
+              tex_info += fmt::format(" t{}={:016x}", i, g_texture_cache->GetBoundTextureHash(i));
+            const auto& pnm = vertex_shader_manager.constants.posnormalmatrix;
+            // Last 3 vertices (zfreeze position cache) in the game's clip space: NDC x/y and
+            // w (= -view z for perspective), to tell HUD layers apart by screen spot and depth.
+            std::string vtx_info;
+            if (m_current_pipeline_config.vertex_format)
+            {
+              const PortableVertexDeclaration vtx_decl =
+                  m_current_pipeline_config.vertex_format->GetVertexDeclaration();
+              u32 mtx_idx = g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
+              for (int i = 2; i >= 0; --i)
+              {
+                if (vtx_decl.posmtx.enable)
+                  mtx_idx = VertexLoaderManager::position_matrix_index_cache[i];
+                float pos[3] = {VertexLoaderManager::position_cache[i][0],
+                                VertexLoaderManager::position_cache[i][1],
+                                vtx_decl.position.components == 2 ?
+                                    0.0f :
+                                    VertexLoaderManager::position_cache[i][2]};
+                float clip[4];
+                vertex_shader_manager.TransformToClipSpace(pos, clip, mtx_idx);
+                const float w = std::abs(clip[3]) > 1e-6f ? clip[3] : 1e-6f;
+                vtx_info +=
+                    fmt::format(" v({:.2f},{:.2f} w={:.2f})", clip[0] / w, clip[1] / w, clip[3]);
+              }
+            }
+            INFO_LOG_FMT(VIDEO,
+                         "VR_DRAWX #{}: tex={} blend={} sub={} src={} dst={}{} | sig_alpha={:08x} "
+                         "cu={} au={} viewz={:.2f}{} |{}",
+                         m_draw_counter, used_textures.Count(),
+                         bpmem.blendmode.blend_enable.Value(), bpmem.blendmode.subtract.Value(),
+                         static_cast<u32>(bpmem.blendmode.src_factor.Value()),
+                         static_cast<u32>(bpmem.blendmode.dst_factor.Value()), efb_info,
+                         bpmem.alpha_test.hex, color_update ? 1 : 0, alpha_update ? 1 : 0,
+                         pnm[2][3], tex_info, vtx_info);
             if (proj.type == ProjectionType::Orthographic)
             {
               const float* p = proj.rawProjection.data();
@@ -1732,6 +1797,22 @@ void VertexManagerBase::Flush()
                            hunter_skip);
             }
           }
+        }
+
+        // Background fill: an opaque untextured quad drawn last, depth-tested against the scene
+        // without writing depth, so on a flat screen it only colours the empty background (PSO
+        // does this every frame). Reprojected in stereo it lands in front of the scene and
+        // becomes an opaque panel, so drop it; the VR eye buffers are already cleared.
+        if (g_ActiveConfig.vr_skip_background_fill &&
+            g_ActiveConfig.stereo_mode == StereoMode::OpenXR && !vr_flat_mode && !hunter_skip &&
+            !elements_skip && !texmgr_skip && used_textures.Count() == 0 &&
+            !bpmem.blendmode.blend_enable && !bpmem.blendmode.subtract && bpmem.zmode.test_enable &&
+            bpmem.zmode.func != CompareMode::Always && !bpmem.zmode.update_enable &&
+            m_index_generator.GetIndexLen() == 6)
+        {
+          hunter_skip = true;
+          if (hunter_debug_logging) [[unlikely]]
+            INFO_LOG_FMT(VIDEO, "VR_DRAW #{}: skipped as background fill", m_draw_counter);
         }
 
         // Auto-detect EFB-copy effects: bloom, motion blur, and post-processing draw as ortho
@@ -2211,6 +2292,35 @@ void VertexManagerBase::OnEndFrame()
     TextureElementManager::GetInstance().LoadOverridesIfNeeded(game_id);
     HideObjectEngine::Engine::GetInstance().LoadCodesIfNeeded(game_id);
   }
+  // PSO VR: on-demand draw capture. Creating <User>/vr_draw_capture logs every draw of the next
+  // frames (projection, viewport, shader hashes) through the Shader Hunter debug logging, which
+  // otherwise can only be toggled from the desktop Qt UI.
+  constexpr u32 DRAW_CAPTURE_FRAMES = 3;
+  if (m_draw_capture_frames_left > 0)
+  {
+    if (--m_draw_capture_frames_left == 0)
+    {
+      hunter.SetDebugLogging(false);
+      NOTICE_LOG_FMT(VIDEO, "VR_CAPTURE: end");
+    }
+    else
+    {
+      NOTICE_LOG_FMT(VIDEO, "VR_CAPTURE: frame boundary ({} draws)", m_draw_counter);
+    }
+  }
+  else if (++m_draw_capture_poll_frames >= 30)
+  {
+    m_draw_capture_poll_frames = 0;
+    const std::string trigger = File::GetUserPath(D_USER_IDX) + "vr_draw_capture";
+    if (File::Exists(trigger))
+    {
+      File::Delete(trigger);
+      m_draw_capture_frames_left = DRAW_CAPTURE_FRAMES + 1;
+      hunter.SetDebugLogging(true);
+      NOTICE_LOG_FMT(VIDEO, "VR_CAPTURE: begin ({} frames)", DRAW_CAPTURE_FRAMES);
+    }
+  }
+
   hunter.OnFrameEnd();
   CullingCodeFinder::GetInstance().OnFrameEnd();
   ElementsGroupManager::GetInstance().OnFrameEnd();
@@ -2288,6 +2398,29 @@ void VertexManagerBase::RenderDrawCall(
 {
   // Now we can upload uniforms, as nothing else will override them.
   geometry_shader_manager.SetConstants(primitive_type);
+  // PSO VR: the GS route actually taken by this draw (stereoparams.w: 1 = head-tracked scene,
+  // 0 = game projection untouched, < 0 = screen/pane paths) and the X rows of both eye
+  // projections, to see which draws lose head tracking.
+  if (ShaderHunter::GetInstance().IsDebugLogging()) [[unlikely]]
+  {
+    const auto& c = geometry_shader_manager.constants;
+    const int x_off = bpmem.scissorOffset.x << 1;
+    const int y_off = bpmem.scissorOffset.y << 1;
+    const VR::VRFrameRegion frame = VR::GetVRFrameRegion();
+    INFO_LOG_FMT(VIDEO,
+                 "VR_GS #{}: prim={} route={:.2f} off=({},{}) frame=({},{} {}x{} v={}) class={} "
+                 "sp=({:.2f},{:.2f},{:.2f}) "
+                 "L0=({:.3f},{:.3f},{:.3f},{:.2f}) R0=({:.3f},{:.3f},{:.3f},{:.2f}) "
+                 "screen=({:.2f},{:.2f},{:.2f}) hlp.w={:.2f}",
+                 m_draw_counter, static_cast<int>(primitive_type), c.stereoparams[3], x_off, y_off,
+                 frame.left, frame.top, frame.width, frame.height, frame.valid,
+                 static_cast<int>(VR::ClassifyVRViewport(xfmem.viewport, x_off, y_off)),
+                 c.stereoparams[0], c.stereoparams[1], c.stereoparams[2], c.eye_projection[0][0],
+                 c.eye_projection[0][1], c.eye_projection[0][2], c.eye_projection[0][3],
+                 c.eye_projection[2][0], c.eye_projection[2][1], c.eye_projection[2][2],
+                 c.eye_projection[2][3], c.vr_screen[0], c.vr_screen[1], c.vr_screen[2],
+                 c.head_locked_params[3]);
+  }
   pixel_shader_manager.SetConstants();
   if (!custom_pixel_shader_uniforms.empty() &&
       pixel_shader_manager.custom_constants.data() != custom_pixel_shader_uniforms.data())

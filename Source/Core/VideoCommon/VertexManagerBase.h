@@ -252,6 +252,9 @@ private:
   // CPU access tracking
   u32 m_draw_counter = 0;
   u32 m_last_efb_copy_draw_counter = 0;
+  // PSO VR: on-demand draw capture, triggered by creating <User>/vr_draw_capture (e.g. via adb).
+  u32 m_draw_capture_poll_frames = 0;
+  u32 m_draw_capture_frames_left = 0;
   bool m_metroid_prime1_combat_context_seen = false;
   bool m_metroid_prime1_menu_context_seen = false;
   MetroidElementProfile m_metroid_profile{};  // == MetroidElementProfile::None until resolved

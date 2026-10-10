@@ -8,6 +8,9 @@
 #include <unistd.h>
 
 #include "Common/Config/Config.h"
+#include "Common/FileUtil.h"
+#include "Common/Logging/Log.h"
+#include "Common/StringUtil.h"
 #include "Common/Thread.h"
 
 #include "Core/Config/GraphicsSettings.h"
@@ -39,6 +42,46 @@ bool IsHotkey(int id, bool held = false)
 {
   return HotkeyManagerEmu::IsPressed(id, held);
 }
+
+// PSO VR: savestates from adb. Creating <User>/vr_save_state or <User>/vr_load_state (optionally
+// containing a slot number 1..10, default 1) saves or loads that slot, since the headset has no
+// keyboard for the state hotkeys and opening the Quest system menu stops emulation.
+bool TakeStateTrigger(const char* name, int* slot)
+{
+  const std::string path = File::GetUserPath(D_USER_IDX) + name;
+  if (!File::Exists(path))
+    return false;
+  std::string contents;
+  File::ReadFileToString(path, contents);
+  File::Delete(path);
+  int value = 1;
+  if (TryParse(std::string(StripWhitespace(contents)), &value) && value >= 1 && value <= 10)
+    *slot = value;
+  else
+    *slot = 1;
+  return true;
+}
+
+void PollStateTriggers(Core::System& system)
+{
+  const Core::State state = Core::GetState(system);
+  if (state != Core::State::Running && state != Core::State::Paused)
+    return;
+  int slot;
+  if (TakeStateTrigger("vr_save_state", &slot))
+  {
+    NOTICE_LOG_FMT(CORE, "VR_STATE: save slot {}", slot);
+    HostThreadLock guard;
+    State::Save(system, slot);
+  }
+  if (TakeStateTrigger("vr_load_state", &slot))
+  {
+    NOTICE_LOG_FMT(CORE, "VR_STATE: load slot {}", slot);
+    HostThreadLock guard;
+    State::Load(system, slot);
+  }
+}
+constexpr int kStateTriggerPollTicks = 30;  // ~330 ms
 }  // namespace
 
 HotkeyDispatcher::~HotkeyDispatcher()
@@ -82,10 +125,17 @@ void HotkeyDispatcher::Run()
   setpriority(PRIO_PROCESS, gettid(), kBackgroundNice);
 
   Core::System& system = Core::System::GetInstance();
+  int state_trigger_ticks = 0;
 
   while (!m_stop_requested.IsSet())
   {
     Common::SleepCurrentThread(kPollPeriodMs);
+
+    if (++state_trigger_ticks >= kStateTriggerPollTicks)
+    {
+      state_trigger_ticks = 0;
+      PollStateTriggers(system);
+    }
 
     g_controller_interface.SetCurrentInputChannel(ciface::InputChannel::Host);
     g_controller_interface.UpdateInput();
